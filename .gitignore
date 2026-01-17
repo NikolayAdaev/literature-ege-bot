@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+literature_bot.db
+debug_error.png
+geckodriver.log
