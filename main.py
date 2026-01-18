@@ -17,6 +17,10 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
+# Очистка ID от пробелов
+if ADMIN_ID:
+    ADMIN_ID = str(ADMIN_ID).strip()
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 db = Database('literature_bot.db')
@@ -30,6 +34,15 @@ class Solving(StatesGroup):
 main_kb = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🔥 Получить задания на сегодня")]
 ], resize_keyboard=True)
+
+# --- ПРИ ЗАПУСКЕ ---
+async def on_startup():
+    print("--- ДИАГНОСТИКА ---")
+    if not ADMIN_ID:
+        print("❌ ОШИБКА: ADMIN_ID не найден в файле .env!")
+    else:
+        print(f"✅ ADMIN_ID загружен: {ADMIN_ID}")
+    print("-------------------")
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -53,16 +66,34 @@ async def process_name(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(f"Приятно познакомиться, {safe_name}! Регистрация пройдена.", reply_markup=main_kb)
 
+# --- ЗАПУСК ПОЛУЧЕНИЯ ЗАДАНИЙ (УМНАЯ ВЕРСИЯ) ---
 @dp.message(F.text == "🔥 Получить задания на сегодня")
 async def start_daily_tasks(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
+    
+    # 1. ПРОВЕРКА: Есть ли незаконченные задания (статус 0) с сегодняшней датой?
+    # Это "восстановление сессии"
+    pending_tasks = db.get_pending_tasks(user_id)
+    
+    if pending_tasks:
+        await message.answer("🔄 **Нашел незаконченные задания! Продолжаем...**", parse_mode="Markdown")
+        # Загружаем их в состояние
+        await state.set_data({'tasks_queue': pending_tasks, 'current_index': 0})
+        await send_next_task(message, state)
+        return
+
+    # 2. Если незаконченных нет, проверяем лимит на сегодня
     if db.check_today_completed(user_id):
         await message.answer("✋ **На сегодня план выполнен!**\nВозвращайся завтра за новой порцией заданий.", parse_mode="Markdown")
         return
+
+    # 3. Если лимит не исчерпан, берем новые + долги
     tasks = db.get_new_tasks_for_user(user_id)
+    
     if not tasks:
         await message.answer("На сегодня заданий больше нет. Приходи завтра!")
         return
+
     await state.set_data({'tasks_queue': tasks, 'current_index': 0})
     await send_next_task(message, state)
 
@@ -116,8 +147,20 @@ async def user_show_text(callback: types.CallbackQuery):
 
 @dp.message(Solving.waiting_for_answer)
 async def check_answer(message: types.Message, state: FSMContext):
+    # Проверка на наличие текста (вдруг стикер прислали)
+    if not message.text:
+        await message.answer("Пожалуйста, пришли ответ текстом!")
+        return
+
     user_answer = message.text.strip().lower()
     data = await state.get_data()
+    
+    # Если бот перезагрузился во время решения, state data может быть пустым
+    if not data or 'tasks_queue' not in data:
+        await message.answer("⚠️ Произошла ошибка состояния. Пожалуйста, нажми «🔥 Получить задания» заново.")
+        await state.clear()
+        return
+
     index = data['current_index']
     task = data['tasks_queue'][index]
     db_answer = db.get_correct_answer(task['id']) 
@@ -158,41 +201,41 @@ async def finish_daily_session(message: types.Message, state: FSMContext):
                        f"👤 Ученик: {safe_name}\n"
                        f"📊 Результат: {correct_count}/{total_count}")
         
-        await bot.send_message(ADMIN_ID, header_text, parse_mode="HTML")
+        try:
+            await bot.send_message(ADMIN_ID, header_text, parse_mode="HTML")
+        except Exception as e:
+            print(f"❌ НЕ УДАЛОСЬ ОТПРАВИТЬ ОТЧЕТ АДМИНУ: {e}")
         
         if correct_count != total_count:
             for s in stats:
                 # s: (result_id, task_id, line, status, user_ans, cor_ans, q_text)
                 if s[3] == 2: # Если ошибка
-                    result_id = s[0]
-                    task_id = s[1] # Это ID задания в таблице tasks
-                    line = s[2]
-                    u_ans = html.escape(s[4]) if s[4] else "Нет ответа"
-                    c_ans = html.escape(s[5])
-                    q_text = html.escape(s[6])
-                    q_text_short = q_text[:150] + "..." if len(q_text) > 150 else q_text
-                    
-                    err_msg = (
-                        f"❌ <b>Ошибка (Линия {line})</b>\n\n"
-                        f"❓ <b>Вопрос:</b> {q_text_short}\n"
-                        f"👤 <b>Ответ ученика:</b> {u_ans}\n"
-                        f"✅ <b>Правильно:</b> {c_ans}"
-                    )
-                    
-                    # Кнопки для админа (ДОБАВИЛ УДАЛЕНИЕ ЗАДАНИЯ)
-                    # result_id - для исправления оценки ученика
-                    # task_id - для удаления задания из БД
-                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="📖 Показать текст", callback_data=f"adm_text_show_{result_id}")],
-                        [InlineKeyboardButton(text="✅ Отметить как правильное", callback_data=f"adm_mark_correct_{result_id}")],
-                        [InlineKeyboardButton(text="🗑 Удалить задание из БД", callback_data=f"adm_task_del_{task_id}")]
-                    ])
-                    
                     try:
+                        result_id = s[0]
+                        task_id = s[1]
+                        line = s[2]
+                        u_ans = html.escape(s[4]) if s[4] else "Нет ответа"
+                        c_ans = html.escape(s[5])
+                        q_text = html.escape(s[6])
+                        q_text_short = q_text[:150] + "..." if len(q_text) > 150 else q_text
+                        
+                        err_msg = (
+                            f"❌ <b>Ошибка (Линия {line})</b>\n\n"
+                            f"❓ <b>Вопрос:</b> {q_text_short}\n"
+                            f"👤 <b>Ответ ученика:</b> {u_ans}\n"
+                            f"✅ <b>Правильно:</b> {c_ans}"
+                        )
+                        
+                        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="📖 Показать текст", callback_data=f"adm_text_show_{result_id}")],
+                            [InlineKeyboardButton(text="✅ Отметить как правильное", callback_data=f"adm_mark_correct_{result_id}")],
+                            [InlineKeyboardButton(text="🗑 Удалить задание из БД", callback_data=f"adm_task_del_{task_id}")]
+                        ])
+                        
                         await bot.send_message(ADMIN_ID, err_msg, parse_mode="HTML", reply_markup=keyboard)
                         await asyncio.sleep(0.2)
                     except Exception as e:
-                        print(f"Ошибка отправки админу: {e}")
+                        print(f"Ошибка отправки детального отчета: {e}")
 
 # --- КНОПКА "ПОКАЗАТЬ/СКРЫТЬ ТЕКСТ" ---
 @dp.callback_query(F.data.startswith("adm_text_"))
@@ -264,18 +307,30 @@ async def admin_toggle_task_active(callback: types.CallbackQuery):
     await callback.message.edit_text(new_text, parse_mode="HTML", reply_markup=new_markup)
     await callback.answer("Статус задания изменен")
 
-# Вспомогательная функция для замены кнопок
 def update_button(markup, row_index, new_text, new_callback):
     rows = markup.inline_keyboard
-    # Проверяем, существует ли такая кнопка (чтобы не упало)
     if row_index < len(rows) and len(rows[row_index]) > 0:
         rows[row_index][0].text = new_text
         rows[row_index][0].callback_data = new_callback
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+# --- ЛОВУШКА ДЛЯ ПОТЕРЯННОГО СОСТОЯНИЯ ---
+# Этот хендлер должен быть ПОСЛЕДНИМ
+@dp.message()
+async def handle_unknown_message(message: types.Message):
+    await message.answer(
+        "😴 <b>Бот был перезагружен и забыл контекст.</b>\n\n"
+        "Пожалуйста, нажми кнопку <b>«🔥 Получить задания на сегодня»</b>, чтобы продолжить!",
+        reply_markup=main_kb,
+        parse_mode="HTML"
+    )
+
 async def main():
+    await on_startup()
     print("Бот запущен!")
+    await bot.delete_webhook(drop_pending_updates=True) 
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())

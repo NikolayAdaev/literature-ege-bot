@@ -58,6 +58,29 @@ class Database:
             # Если 5 или больше, значит план на сегодня всё.
             return count >= 5
 
+    def get_pending_tasks(self, user_id):
+        """
+        Ищет задания, которые были выданы СЕГОДНЯ, но еще не решены (status = 0).
+        Нужно для восстановления сессии после перезагрузки бота.
+        """
+        with self.connection:
+            tasks = self.cursor.execute('''
+                SELECT t.id, t.line_number, t.question_text, t.options_text, t.content_text
+                FROM user_results ur
+                JOIN tasks t ON ur.task_id = t.id
+                WHERE ur.user_id = ? 
+                AND ur.status = 0 
+                AND ur.assigned_date = CURRENT_DATE
+            ''', (user_id,)).fetchall()
+            
+            result = []
+            for task in tasks:
+                result.append({
+                    'id': task[0], 'line': task[1], 'question': task[2], 
+                    'options': task[3], 'text': task[4], 'is_debt': False 
+                })
+            return result
+
     def get_new_tasks_for_user(self, user_id):
         """
         Логика:
@@ -127,9 +150,12 @@ class Database:
                 WHERE user_id = ? AND task_id = ?
             ''', (status, user_answer, user_id, task_id))
 
+    # --- ИЗМЕНЕНИЯ ДЛЯ АДМИНКИ НИЖЕ ---
+
     def get_daily_stats(self, user_id):
         """Возвращает список всех заданий, решенных СЕГОДНЯ (для отчета)"""
         with self.connection:
+            # ВАЖНО: Добавили ur.id первым полем, чтобы админ мог менять статус конкретной записи
             stats = self.cursor.execute('''
                 SELECT ur.id, t.id, t.line_number, ur.status, ur.user_answer, t.correct_answer, t.question_text
                 FROM user_results ur
@@ -141,6 +167,7 @@ class Database:
     def toggle_result_status(self, result_id, new_status):
         """
         Меняет статус конкретного решения (1 - верно, 2 - неверно).
+        Используется админом для ручной корректировки.
         """
         with self.connection:
             self.cursor.execute("UPDATE user_results SET status = ? WHERE id = ?", (new_status, result_id))
@@ -148,6 +175,7 @@ class Database:
     def get_task_text_by_result_id(self, result_id):
         """
         Получает текст произведения, зная ID результата в таблице user_results.
+        Нужен для кнопки 'Показать текст' в админ-отчете.
         """
         with self.connection:
             res = self.cursor.execute('''
