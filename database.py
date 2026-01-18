@@ -3,8 +3,14 @@ import datetime
 
 class Database:
     def __init__(self, db_file):
-        self.connection = sqlite3.connect(db_file)
+        # check_same_thread=False важен для асинхронного бота
+        self.connection = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.connection.cursor()
+        
+        # Включаем WAL-режим (Write-Ahead Logging)
+        # Это позволяет читать и писать в базу одновременно без лагов
+        self.cursor.execute("PRAGMA journal_mode=WAL;")
+        self.cursor.execute("PRAGMA synchronous=NORMAL;")
 
     def user_exists(self, user_id):
         with self.connection:
@@ -54,42 +60,20 @@ class Database:
 
     def get_new_tasks_for_user(self, user_id):
         """
-        Подбирает 5 заданий на сегодня:
-        1. Долги (старые ошибки).
-        2. Новые задания (по сегодняшним линиям), если долгов < 5.
+        Логика:
+        1. 5 свежих заданий на сегодня (в первую очередь).
+        2. Все накопившиеся долги за прошлые дни (дополнительный блок).
         """
         tasks_to_send = []
         lines_today = self.get_todays_lines()
 
         with self.connection:
-            # 1. Ищем ДОЛГИ (status = 2). 
-            # ВАЖНО: Добавлена проверка t.is_active = 1, чтобы не выдавать удаленные задания
-            debts = self.cursor.execute('''
-                SELECT t.id, t.line_number, t.question_text, t.options_text, t.content_text
-                FROM user_results ur
-                JOIN tasks t ON ur.task_id = t.id
-                WHERE ur.user_id = ? AND ur.status = 2 
-                AND ur.assigned_date != CURRENT_DATE
-                AND t.is_active = 1
-                LIMIT 5
-            ''', (user_id,)).fetchall()
-            
-            for task in debts:
-                tasks_to_send.append({
-                    'id': task[0], 'line': task[1], 'question': task[2], 
-                    'options': task[3], 'text': task[4], 'is_debt': True
-                })
-
-            # Если долгов уже 5 или больше, новые не ищем
-            if len(tasks_to_send) >= 5:
-                return tasks_to_send[:5]
-
-            # 2. Ищем НОВЫЕ задания
-            needed_count = 5 - len(tasks_to_send)
-            current_lines_queue = lines_today[:needed_count]
+            # --- БЛОК 1: НОВЫЕ ЗАДАНИЯ (5 штук) ---
+            # Берем первые 5 линий из расписания на сегодня
+            current_lines_queue = lines_today[:5]
             
             for line in current_lines_queue:
-                # ВАЖНО: Добавлена проверка is_active = 1
+                # Ищем нерешенное задание по этой линии
                 task = self.cursor.execute('''
                     SELECT id, line_number, question_text, options_text, content_text 
                     FROM tasks 
@@ -100,6 +84,7 @@ class Database:
                 ''', (line, user_id)).fetchone()
                 
                 if task:
+                    # Записываем выдачу в базу
                     self.cursor.execute("INSERT INTO user_results (user_id, task_id, status, assigned_date) VALUES (?, ?, 0, CURRENT_DATE)", 
                                         (user_id, task[0]))
                     
@@ -107,6 +92,24 @@ class Database:
                         'id': task[0], 'line': task[1], 'question': task[2], 
                         'options': task[3], 'text': task[4], 'is_debt': False
                     })
+
+            # --- БЛОК 2: ДОЛГИ (Все остальные) ---
+            # Статус 2 = ошибка/пропуск, Дата != сегодня, Задание активно
+            debts = self.cursor.execute('''
+                SELECT t.id, t.line_number, t.question_text, t.options_text, t.content_text
+                FROM user_results ur
+                JOIN tasks t ON ur.task_id = t.id
+                WHERE ur.user_id = ? 
+                AND ur.status = 2 
+                AND ur.assigned_date != CURRENT_DATE
+                AND t.is_active = 1
+            ''', (user_id,)).fetchall()
+            
+            for task in debts:
+                tasks_to_send.append({
+                    'id': task[0], 'line': task[1], 'question': task[2], 
+                    'options': task[3], 'text': task[4], 'is_debt': True
+                })
             
             return tasks_to_send
 
